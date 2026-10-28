@@ -263,6 +263,67 @@ FSP-S -> [ECAM + 0xFC] -> 和 3/4 比较
 - 消费级 B660/Z690 换的是 **另一套 FSP/BIOS**，策略可能不同；12500 无 E-core，老 BIOS/老微码下开 AVX512 是已知可行的。
 - 3/4 不是“AVX512 开关”；它是整段 CPU init tail 的跳过条件。即使能改，也会跳过 MSR 0xCF/0xF1 的 workaround，可能破坏 CPU init，不是可用的解锁路径。
 
+### 5.5 进一步推测：3/4 的类别与 MSR 0xCF/0xF1
+
+> 以下内容为代码推断。公开 Intel 资料没有定义 3/4 字段和 MSR 0xCF/0xF1 的名称/语义，结论请按“推测”看待。
+
+#### 5.5.1 3/4 是字段值，不是“bit3/bit4”
+
+- `0x10b24` 读 `[ECAM + 0xFC]` = CAPID0_E 高字节（bits 31:24）。
+- FSP-S 用 `cmp al,3` / `cmp al,4` 比较整个 byte，所以 3/4 是**字段值**，不是单个 bit。
+- 公开 CAPID0_E：bit24 = CRASHLOG_DIS，bits31:25 = Reserved。
+- 3 = `0b00000011`（bit24+25），4 = `0b00000100`（bit26）；只能落在 Reserved 位里，具体位宽未公开。
+
+#### 5.5.2 调用点线索
+
+| 调用点 | 3/4 命中时 | 线索 |
+|---|---|---|
+| `0x2b76` / `0x2b7f` | 跳过 MSR 0x650/0x651 读取 | 0x650/0x651 像 memory/DDR 相关 |
+| `0x2d19` / `0x2d26` | 跳过一段 memory 初始化 | 同上 |
+| `0x4adc` / `0x4b2e` | type4 走另一条 PCH/PCIe 路径（`0x434`） | PCH 配置不同 |
+| `0x3bdf` | 影响 ratio/frequency 计算 | DDR/fabric ratio |
+| `0x128c` | type4 跳过 `[0xFC]` 读取/策略 | policy 不同 |
+| `0x13462` | 跳过整段 AVX tail | AVX 策略不同 |
+
+`0x12a0` 的 type4 分支还会检查 `CPUID == 0x906A0`（ADL-P），说明 3/4 至少和移动端/ADL-P 相关。
+
+**推测**：3/4 是 **平台/CPU class**（移动端 ADL-P / 小核 ADL-N / 其他 SoC 段位），不是 AVX 开关。3 和 4 具体哪个对应哪个类，公开资料无法确认。12500 是桌面大核 ADL-S，不属于 3/4，所以走 AVX tail 并被禁。
+
+#### 5.5.3 MSR 0xCF / 0xF1
+
+```asm
+1348a: mov  ecx,0xCF
+1348f: rdmsr
+13495: test al,0x2          ; 0xCF bit1
+13497: je   0x134c0
+13499: mov  ecx,0xF1
+1349e: rdmsr
+134a4: and  eax,0xFFFFFF00  ; 清 0xF1 低 8 位
+134b9: mov  ecx,0xF1
+134be: wrmsr
+```
+
+`0xCF` 还有第二处使用：
+
+```asm
+571: mov  ecx,0xCF
+576: rdmsr
+57c: test al,0x4          ; 0xCF bit2
+57e: je   0x589
+580: ... call 0x164a3     ; 另一个 workaround
+```
+
+- `0xCF` 更像 **capability/erratum bitfield**（bit1、bit2 触发不同 workaround）。
+- `0xF1` 低字节更像 **feature bitmap**；清零 = 禁用一组 feature。
+- 这是**条件性 feature-disable workaround**；它在 AVX tail 里，且 3/4 类会跳过，所以大概率与 **AVX/大核 feature** 有关；具体是 AVX512、AMX 还是别的，公开资料无法确认。
+- **MSR 0xCF / 0xF1 不在公开 Intel SDM 里**，是 FSP/硅片私有；不要从 OS 乱写。
+
+#### 5.5.4 结论
+
+- 3/4 是 **平台 class**，不是 AVX512 enable；3/4 类跳过 AVX tail 是因为它们的 memory/PCH/AVX 策略不同。
+- 0xCF/0xF1 是**未公开的 capability/feature workaround**，不是通用开关。
+- 这两点都不改变最终结论：T3660 上不存在可用的 3/4 配置后门；软件路径仍然闭环。
+
 ## 6. 为什么改 FSP 会砖
 
 1. 改 `SiInitFsp` → FSP-S 外层 FV 哈希变。
