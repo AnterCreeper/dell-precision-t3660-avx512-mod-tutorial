@@ -8,7 +8,8 @@
 - 1.2.38 的 `SiInitFsp` 在 P-core / 非 ADL-N 上写 **MSR 0xAF bit1**，禁用 AVX-512。
 - 改 FSP-S 不可行：BootGuard 验证 IBB（FSP-M + 校验器），IBB 里的 `DellTrustChainingPei` 再用 `__MHTS__` 验证 FSP-S；改 FSP-S 会破坏 FV 哈希，直接不启动。
 - 运行时写 MSR 0xAF 也不行：0xAF 表现为 **write-once**；且这台 T3660 每次重启掉电，FSP-S 每次重跑并重写。
-- 3/4 的来源不是 NVRAM/Setup：FSP-M 通过 **PCIEXBAR → ECAM → CAPID0_E+0xFC** 读平台能力位；公开 CAPID0 字段里没有 CPU Segment，3/4 是私有/保留位或另一个 PCD。
+- 3/4 的来源不是 NVRAM/Setup：FSP-M 通过 **PCIEXBAR → ECAM → CAPID0_E+0xFC** 读平台能力位；公开 CAPID0 字段里没有 CPU Segment。
+- 但 3/4 分支 `jne 0x134d8` 是跳到函数 epilogue，跳过的是 **整段 CPU init tail（MSR 0xCF/0xF1 + 0x1317e + 0x1320d）**，不是“只跳过 AVX512”。3/4 是 CPU-class/feature-path 的适用性 gate，不是可用的 AVX512 开关。
 - 只剩：换消费级 B660/Z690 老 BIOS、ES/换 CPU 赌 CAPID0/DID0、PCH + BIOS 大改，或接受 AVX2。
 
 ## 0. 对早期版本的修正
@@ -153,12 +154,17 @@ CPUID(7,0).EDX bit15 = HYBRID
 1346c: call 0x5643          ; PCD 读取 == 3 ?
 13471: mov  ds:0x35e8c,al
 1347d: cmp  byte ds:0x35e8f,0
-13484: jne  0x134d8         ; PCD==4 -> 跳过 0x1317e/0x1320d
+13484: jne  0x134d8         ; PCD==4 -> 跳到函数 epilogue
 13486: test al,al
-13488: jne  0x134d8         ; PCD==3 -> 跳过
+13488: jne  0x134d8         ; PCD==3 -> 跳到函数 epilogue
 134ce: call 0x1317e
 134d3: call 0x1320d
+134d8: pop esi; pop ebx; mov esp,ebp; pop ebp; ret   ; epilogue
 ```
+
+注意 `jne 0x134d8` 是跳到函数 epilogue，不是跳到某个“AVX 之后”的标签。它跳过的是整段 tail：
+MSR 0xCF/0xF1 的 workaround、config bit、`0x1317e`（bit0）、`0x1320d`（bit1）。
+所以 3/4 不是“只跳过 AVX512”，而是“这个 CPU 类型不走这段 CPU init tail”。
 
 `0x562d` / `0x5643` → `0x10b24` → `0x2f007`：
 
@@ -196,6 +202,8 @@ FSP-S -> [ECAM + 0xFC] -> 和 3/4 比较
 
 `ECAM + 0xFC` = **D0:F0 offset 0xFC** = **CAPID0_E 的高字节（bits 24–31）**。
 
+但 3/4 不是 AVX512 policy：它命中的是 `0x13484/0x13488` 的整段 tail 跳过。把它当成“AVX512 enable”是误读；即使能改到 3/4，也会跳过 MSR 0xCF/0xF1 的 workaround，CPU init 可能不完整。
+
 ## 5. CAPID0 调研
 
 ### 5.1 寄存器布局（12th Gen Datasheet Vol.2）
@@ -230,6 +238,7 @@ FSP-S -> [ECAM + 0xFC] -> 和 3/4 比较
 - CAPID0 在 **CPU 的 Host Bridge**；换 PCH 不会改 CPU 的 CAPID0。PCH 换 + FSP 改是绕 BootGuard 的路径，不是改 CAPID0。
 - ES/QS 样片的 DID0/CAPID0 可能不同（DID0OE 就是给 debug/samples 的）；3/4 有可能对应样片/调试平台 ID。这是“有依据的赌博”，不保证。
 - 消费级 B660/Z690 换的是 **另一套 FSP/BIOS**，策略可能不同；12500 无 E-core，老 BIOS/老微码下开 AVX512 是已知可行的。
+- 3/4 不是“AVX512 开关”；它是整段 CPU init tail 的跳过条件。即使能改，也会跳过 MSR 0xCF/0xF1 的 workaround，可能破坏 CPU init，不是可用的解锁路径。
 
 ## 6. 为什么改 FSP 会砖
 
@@ -252,16 +261,18 @@ FSP-S -> [ECAM + 0xFC] -> 和 3/4 比较
 
 | # | 条件 | 12500 |
 |---|---|---|
-| 1 | PCD 3/4（CAPID0_E 私有位 / ECAM 字节） | 否 |
+| 1 | PCD 3/4（CAPID0_E 私有位 / ECAM 字节）—— 整段 tail 跳过，不是 AVX512 专用 | 否 |
 | 2 | CPUID 类型 0x20：E-core 或 ADL-N（0xB06E0） | 否 |
 | 3 | XSAVE 不支持（CPUID.1.ECX bit26 = 0） | 否 |
 | 4 | MSR 0xAF bit0/bit1 已置位 | 否（当前是 0） |
 | 5 | 外层 CPU init 函数未被调用（phase/policy） | 不适用 |
 | 6 | 微码 ≤ 0x16、未熔断（CPU 侧） | **是**，但 FSP 仍会禁 |
 
+注：真正的 AVX512-specific skip 只有 #2（CPUID 0x20）和 #3/#4；#1 是 CPU-class/feature-path gate，不是可用的“AVX512 enable”。
+
 ## 9. 结论与可选路径
 
-- **T3660 + 1.2.38 的纯软件解锁是闭环的**：CAPID0/ECAM 堵配置，BootGuard + MHTS 堵代码，write-once MSR 堵运行时。
+- **T3660 + 1.2.38 的纯软件解锁是闭环的**：CAPID0/ECAM 堵配置（而且 3/4 不是 AVX512 开关），BootGuard + MHTS 堵代码，write-once MSR 堵运行时。
 - 可选：
   1. **消费级 B660/Z690 + 老 BIOS/老微码**：最可靠；12500 无 E-core，AVX512 可开。
   2. **ES CPU / ES 板**：赌 CAPID0/DID0 样片值；不保证。
